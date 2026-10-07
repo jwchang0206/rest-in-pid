@@ -23,16 +23,31 @@ board, and a toast announces each new one.
 ## What counts as a zombie
 
 A process belongs to a live session when it descends from that session's
-host process, or when it inherited that session's `CLAUDE_PID` and
-`CLAUDE_CODE_SESSION_ID`. It is a zombie when:
+host process, or when it inherited the host's `CLAUDE_PID` and that host was
+already running when it started (a process that reused the pid since starts
+later). The session id decides nothing there, since `/clear` gives a running
+session a new one. An MCP server inherits `CLAUDE_CODE_SESSION_ID` alone, so
+it belongs to the running session holding that id. It is a zombie when:
 
 - **session ended**: the session it inherited has no running host any more
-  (the pid is gone, or now belongs to another process or session), or it is
-  a Bash tool shell still sourcing a shell snapshot its session deleted
-  (Claude Code deletes a session's snapshot when the session exits);
+  (the pid is gone or was reused, or no running session holds the id), or
+  it is a Bash tool shell still sourcing a shell snapshot its session
+  deleted (Claude Code deletes a session's snapshot when the session exits);
 - **no live session**: nothing says which session started it, it sits in a
-  `.claude/worktrees/<name>` folder, and no running session works there;
-- **worktree deleted**: as above, and that worktree folder no longer exists.
+  `.claude/worktrees/<name>` folder, and no running session works there or
+  in that repository's main checkout;
+- **worktree deleted**: nothing says which session started it, and the
+  worktree folder it sits in no longer exists.
+
+What a live session runs inside, such as its terminal, a tmux server or an
+editor, is never a zombie, even when a session that has since ended started
+it. Nor are the OS's and apps' own binaries, apart from the toolchains kept
+among them: JDKs under `/Library/Java`, Xcode's developer tools, and
+`/usr/lib/jvm` on Linux.
+
+Claude Code's retention sweep deletes shell snapshots older than
+`cleanupPeriodDays` (30 by default) whether their session still runs or
+not, so only a younger snapshot's absence counts.
 
 macOS hides the environment of its own binaries (`/bin/zsh`, `/usr/bin/tail`
 and the like), so a process with no evidence of its own follows its process
@@ -51,18 +66,24 @@ Its descendants are part of its tree, and every process in it counts. A
 `<defunct>` (Unix zombie) process counts too but is never signalled: it is
 already dead, and goes once its parent does.
 
-Live sessions come from `~/.claude/sessions/<pid>.json`. An entry vouches for
+Live sessions come from `sessions/<pid>.json` in Claude Code's folder
+(`~/.claude`, or `CLAUDE_CONFIG_DIR` when it is set). An entry vouches for
 its pid only while the process start time matches, so a reused pid never
 revives a dead session. A Claude Code process with no entry still counts as
 live, so its children are never mistaken for orphans.
 
 ## What Kill does
 
-1. Re-reads `ps` and keeps only the pids that still have the same start
-   time and command as on the board, belong to you, and are not a session
-   host or this session.
-2. Sends `SIGTERM` to the tree, deepest processes first.
-3. Two seconds later, sends `SIGKILL` to whatever survived the same check.
+1. Scans again, so each chosen tree is taken as it runs now: with the
+   children it spawned since the board was drawn, and without anything
+   that has since come to life, such as a shell a new session started in.
+2. Re-reads `ps` and keeps only the pids that still have the same start
+   time and command, belong to you, and are not a session host or this
+   session.
+3. Sends `SIGTERM` to the tree, deepest processes first.
+4. Two seconds later, scans again and sends `SIGKILL`, after the same
+   check, to whatever survived and to anything that rose meanwhile in a
+   process group it signalled, such as a child a dying process spawned.
 
 Docker containers are not host processes and are out of scope.
 
@@ -77,11 +98,13 @@ Everything stays on your machine: the mod makes no network requests.
   you press Kill. On Linux, `/bin/sh` with `tr` and `readlink` reads
   `/proc/<pid>/environ` and `/proc/<pid>/cwd` in place of `ps eww` and
   `lsof`, and `getconf` with `/proc/meminfo` stands in for `sysctl`.
-- **Reads** `~/.claude/sessions/*.json` for the running sessions, and each
-  session's transcript under `~/.claude/projects`, keeping only the token
-  usage of each response. For processes outside every live session it reads
-  the environment, keeping only `CLAUDE_PID` and `CLAUDE_CODE_SESSION_ID`,
-  and checks whether their worktree folder or shell snapshot still exists.
+- **Reads** `sessions/*.json` in Claude Code's folder for the running
+  sessions, and each session's transcript under its `projects`, keeping
+  only the token usage of each response. From Claude Code's settings it
+  reads `cleanupPeriodDays` alone. For processes outside every live session
+  it reads the environment, keeping only `CLAUDE_PID` and
+  `CLAUDE_CODE_SESSION_ID`, and checks whether their worktree folder or
+  shell snapshot still exists.
 
 ## Install
 
@@ -96,7 +119,8 @@ The plugin then loads in Claude Code in the terminal and in the Code tab of
 the Desktop app, which read the same settings. Start a new session, or run
 `/reload-plugins` in one that was already open.
 `claude plugin update rest-in-pid@jwchang0206` fetches a new release once the
-`version` in `plugin.json` goes up.
+`version` in `plugin.json` goes up. [CHANGES.md](CHANGES.md) says what each
+release changed.
 
 Mods need Claude Code 2.1.287 or later in the terminal, or 2.1.286 in the Desktop app.
 

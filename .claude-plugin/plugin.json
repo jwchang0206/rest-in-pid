@@ -1,6 +1,6 @@
 {
   "name": "rest-in-pid",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "displayName": "Rest in PID",
   "description": "Track the processes Claude Code sessions and worktrees spawn, and lay their zombies to rest.",
   "author": { "name": "Jeong Woo Chang" },

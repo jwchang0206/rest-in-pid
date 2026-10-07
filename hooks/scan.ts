@@ -2,6 +2,7 @@ import type { FsEntry, FsStat, ProcessRunInit, ProcessRunResult } from 'claude-c
 
 import type { Machine, Snapshot } from '../types'
 import {
+  bornOf,
   candidatesOf,
   classify,
   parseCwd,
@@ -15,8 +16,11 @@ import {
 } from './model'
 import type { HostEntry, Os, ProcEnv, PsRow, Tally } from './model'
 
-/** The session host this mod runs in, the user it runs as, their home, their system, and the machine. */
-export type Context = { home: string; os: Os; selfUid: number; selfHostPid: number; machine: Machine }
+/**
+ * The session host this mod runs in, the user it runs as, the folder Claude Code keeps its
+ * sessions and transcripts in, their system, and the machine.
+ */
+export type Context = { configDir: string; os: Os; selfUid: number; selfHostPid: number; machine: Machine }
 
 /**
  * The host calls a scan makes. The engine only takes `$` spelled out at each
@@ -29,6 +33,10 @@ export type Io = {
   read: (path: string) => Promise<string>
   stat: (path: string) => Promise<FsStat>
   home: () => Promise<string | undefined>
+  /** CLAUDE_CONFIG_DIR, which Claude Code uses in place of ~/.claude when it is set. */
+  configDir: () => Promise<string | undefined>
+  /** The settings Claude Code runs under, merged over every source. */
+  settings: () => Promise<Readonly<Record<string, unknown>>>
   now: () => Promise<number>
 }
 
@@ -48,6 +56,9 @@ const UTC = { TZ: 'UTC', LC_ALL: 'C' }
 const OUTPUT_CAP = 4_194_304
 const SESSION_ID = /^[\w-]+$/
 const MISSING_TRANSCRIPT_RETRY_MS = 60_000
+const DAY_MS = 86_400_000
+/** Claude Code's cleanupPeriodDays when no settings name one. */
+const RETENTION_DAYS = 30
 // ponytail: at most 8 x 4 MiB of a transcript per scan; a longer backlog finishes over the next scans.
 const CHUNKS_PER_SCAN = 8
 /** Linux: each pid, then the environment it started with, from /proc (what `ps eww` reads on macOS). */
@@ -56,11 +67,11 @@ const LINUX_ENVS = `for p; do printf '%s ' "$p"; tr '\\0\\n' '  ' < "/proc/$p/en
 const LINUX_CWDS = `for p; do d=$(readlink "/proc/$p/cwd" 2>/dev/null) && printf 'p%s\\nn%s\\n' "$p" "$d"; done`
 
 export async function contextOf(io: Io): Promise<Context> {
-  const home = (await io.home()) ?? ''
+  const configDir = (await io.configDir()) || `${(await io.home()) ?? ''}/.claude`
   const { stdout } = await io.run(['/bin/sh', '-c', 'echo "$PPID $(id -u) $(uname -s)"'])
   const [host = '0', uid = '-1', system = ''] = stdout.trim().split(' ')
   const os = osOf(system)
-  return { home, os, selfHostPid: Number(host), selfUid: Number(uid), machine: await machineOf(io, os) }
+  return { configDir, os, selfHostPid: Number(host), selfUid: Number(uid), machine: await machineOf(io, os) }
 }
 
 function osOf(system: string): Os {
@@ -109,21 +120,31 @@ async function missing(io: Io, paths: ReadonlyArray<string | null>): Promise<Set
   return gone
 }
 
-async function readEntries(io: Io, home: string): Promise<HostEntry[]> {
-  const dir = `${home}/.claude/sessions`
+/**
+ * Before when a shell snapshot may be gone while its session still runs: Claude Code's retention
+ * sweep deletes the ones older than cleanupPeriodDays either way.
+ */
+async function sweptBefore(io: Io, now: number): Promise<number> {
+  const settings = await io.settings().catch((): Readonly<Record<string, unknown>> => ({}))
+  const days = settings.cleanupPeriodDays
+  return now - (typeof days === 'number' && days >= 0 ? days : RETENTION_DAYS) * DAY_MS
+}
+
+async function readEntries(io: Io, configDir: string): Promise<HostEntry[]> {
+  const dir = `${configDir}/sessions`
   if (!(await io.exists(dir))) return []
   const files = (await io.list(dir)).filter(file => file.kind === 'file' && file.name.endsWith('.json'))
   const entries = await Promise.all(files.map(async file => parseHost(await io.read(`${dir}/${file.name}`))))
   return entries.filter((entry): entry is HostEntry => entry !== null)
 }
 
-async function readingOf(io: Io, home: string, sessionId: string, readings: Readings) {
+async function readingOf(io: Io, configDir: string, sessionId: string, readings: Readings) {
   const now = await io.now()
   let reading = readings.get(sessionId)
   if (reading === undefined || (reading.path === null && now - reading.checkedAt > MISSING_TRANSCRIPT_RETRY_MS)) {
     const found = await io.run([
       'find',
-      `${home}/.claude/projects`,
+      `${configDir}/projects`,
       '-maxdepth',
       '2',
       '-name',
@@ -193,7 +214,7 @@ async function readEnvs(
   const unread = rows.filter(row => candidates.has(row.pid) && !envs.has(envKey(row)))
   const pids = unread.map(row => String(row.pid))
   const stdout = pids.length === 0 ? '' : await optional(io.run(envProbe(os, pids)))
-  const found = parseEnv(stdout)
+  const found = parseEnv(stdout, new Map(unread.map(row => [row.pid, row.command])))
   const printed = new Set(stdout.split('\n').map(line => Number(/^\s*(\d+)\s/.exec(line)?.[1])))
   const kept: Envs = new Map()
   const env = new Map<number, ProcEnv>()
@@ -212,7 +233,11 @@ async function readEnvs(
 
 export async function scan(io: Io, context: Context, readings: Readings, envs: Envs): Promise<Snapshot> {
   const { os } = context
-  const [rows, entries] = await Promise.all([readPs(io, os), readEntries(io, context.home)])
+  const [rows, entries, swept] = await Promise.all([
+    readPs(io, os),
+    readEntries(io, context.configDir),
+    io.now().then(now => sweptBefore(io, now)),
+  ])
   const candidates = new Set(candidatesOf(rows, entries, context.selfUid, os))
   const pids = [...candidates].map(String)
   const [env, cwdOut] = await Promise.all([
@@ -226,9 +251,13 @@ export async function scan(io: Io, context: Context, readings: Readings, envs: E
     env,
     cwd,
     missingWorktrees: await missing(io, [...cwd.values()].map(worktreeOf)),
+    // Only a snapshot the retention sweep could not have taken says its session exited.
     missingSnapshots: await missing(
       io,
-      rows.filter(row => candidates.has(row.pid)).map(row => snapshotOf(row.command)),
+      rows
+        .filter(row => candidates.has(row.pid))
+        .map(row => snapshotOf(row.command))
+        .map(snapshot => (snapshot !== null && bornOf(snapshot) >= swept ? snapshot : null)),
     ),
     selfUid: context.selfUid,
     os,
@@ -239,7 +268,7 @@ export async function scan(io: Io, context: Context, readings: Readings, envs: E
   ]
   for (const session of sessions) {
     if (!SESSION_ID.test(session.sessionId)) continue
-    const reading = await readingOf(io, context.home, session.sessionId, readings).catch(() => undefined)
+    const reading = await readingOf(io, context.configDir, session.sessionId, readings).catch(() => undefined)
     session.tokensIn = reading?.tokensIn ?? 0
     session.tokensOut = reading?.tokensOut ?? 0
   }

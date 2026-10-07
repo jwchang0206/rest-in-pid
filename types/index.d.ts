@@ -2,6 +2,8 @@
 export type Proc = {
   pid: number
   ppid: number
+  /** Its process group, which a child spawned while it dies shares. */
+  pgid: number
   /** `ps` lstart in UTC. With `pid` and `command` it is what a kill checks again. */
   started: string
   command: string

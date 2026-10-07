@@ -293,6 +293,8 @@ export const register: Register = on => {
       read: path => $.fs.read(path),
       stat: path => $.fs.stat(path),
       home: () => $.env.get('HOME'),
+      configDir: () => $.env.get('CLAUDE_CONFIG_DIR'),
+      settings: () => $.settings.read(),
       now: () => $.clock.now(),
     }
     const readings: Readings = new Map()
@@ -300,7 +302,7 @@ export const register: Register = on => {
     // Earlier versions pinned a status line; the band above the prompt says it now.
     $.ui.status(undefined)
     let context: Context | undefined
-    let isScanning = false
+    let scanning: Promise<Snapshot> | undefined
     let ticks = 0
     let known: ReadonlySet<string> | undefined
 
@@ -318,11 +320,16 @@ export const register: Register = on => {
       )
     }
 
+    /** One scan at a time: a caller arriving mid-scan shares it, so two never read a transcript at once. */
+    const scanNow = (self: Context): Promise<Snapshot> =>
+      (scanning ??= scan(io, self, readings, envs).finally(() => {
+        scanning = undefined
+      }))
+
     const refresh = async () => {
-      if (context === undefined || isScanning) return
-      isScanning = true
+      if (context === undefined) return
       try {
-        const found = await scan(io, context, readings, envs)
+        const found = await scanNow(context)
         const previous = await read($, snapshot)
         if (previous === null || !isSameScan(previous, found)) await update($, snapshot, () => found)
         const total = zombieTotal(found.zombies)
@@ -334,33 +341,51 @@ export const register: Register = on => {
         const message = `Scan failed: ${error instanceof Error ? error.message : String(error)}`
         const at = await $.clock.now()
         await update($, snapshot, previous => ({ ...(previous ?? empty(at)), error: message }))
-      } finally {
-        isScanning = false
       }
+    }
+
+    /** Signals what still runs of these zombies' trees, each pid checked against `ps` once more right before. */
+    const signal = async (self: Context, found: Snapshot, zombies: readonly Zombie[], kind: '-TERM' | '-KILL') => {
+      const hostPids = found.groups.flatMap(group => (group.session.pid === null ? [] : [group.session.pid]))
+      const guard = { selfUid: self.selfUid, protectedPids: new Set([self.selfHostPid, ...hostPids]) }
+      const targets = stillSame(killOrder(zombies), await readPs(io, self.os), guard)
+      if (targets.length > 0) await $.process.run(['/bin/kill', kind, ...targets.map(String)])
+      return targets
     }
 
     const kill = async (roots: number[]) => {
       const self = context
-      const snap = await read($, snapshot)
-      if (self === undefined || snap === null) return
-      const planned = killOrder(snap.zombies, roots)
-      const hostPids = snap.groups.flatMap(group => (group.session.pid === null ? [] : [group.session.pid]))
-      const guard = { selfUid: self.selfUid, protectedPids: new Set([self.selfHostPid, ...hostPids]) }
-      const targets = stillSame(planned, await readPs(io, self.os), guard)
-      if (targets.length === 0) {
+      const board = await read($, snapshot)
+      if (self === undefined || board === null) return
+      // The board can be seconds old: judge again, so each tree is taken as it runs now, with the
+      // children it spawned since and without what has come to life since.
+      const chosen = new Set(board.zombies.filter(zombie => roots.includes(zombie.root.pid)).map(keyOf))
+      const found = await scanNow(self)
+      const doomed = found.zombies.filter(zombie => chosen.has(keyOf(zombie)))
+      const termed = await signal(self, found, doomed, '-TERM')
+      if (termed.length === 0) {
         $.ui.toast('Those zombies were already gone.')
         await refresh()
         return
       }
       await update($, killing, list => [...new Set([...list, ...roots])])
-      await $.process.run(['/bin/kill', '-TERM', ...targets.map(String)])
       $.clock.after(GRACE_MS, () => {
         void (async () => {
           try {
-            const termed = planned.filter(proc => targets.includes(proc.pid))
-            const stubborn = stillSame(termed, await readPs(io, self.os), guard)
-            if (stubborn.length > 0) await $.process.run(['/bin/kill', '-KILL', ...stubborn.map(String)])
-            $.ui.toast(`Killed ${plural(laidToRest(snap.zombies, roots, targets), 'zombie', 'zombies')}`)
+            // What outlived SIGTERM, and what a dying process spawned: it rose since, in a group just signalled.
+            const signalled = doomed
+              .flatMap(zombie => [zombie.root, ...zombie.children])
+              .filter(proc => termed.includes(proc.pid))
+            const outlived = new Set(signalled.map(proc => `${proc.pid}:${proc.started}`))
+            const groups = new Set(signalled.map(proc => proc.pgid))
+            const before = new Set(found.zombies.map(keyOf))
+            const later = await scanNow(self)
+            const stubborn = later.zombies.filter(
+              zombie => outlived.has(keyOf(zombie)) || (!before.has(keyOf(zombie)) && groups.has(zombie.root.pgid)),
+            )
+            const killed = await signal(self, later, stubborn, '-KILL')
+            const cleared = laidToRest([...doomed, ...stubborn], new Set([...termed, ...killed]))
+            $.ui.toast(`Killed ${plural(cleared, 'zombie', 'zombies')}`)
           } finally {
             await update($, killing, list => list.filter(pid => !roots.includes(pid)))
             await refresh()

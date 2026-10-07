@@ -10,7 +10,7 @@ const HOST = `${HOME}/Library/Application Support/Claude/claude-code/2.1.288/abc
 const SESSION = '11111111-2222-3333-4444-555555555555'
 const TRANSCRIPT = `${HOME}/.claude/projects/-Users-me-repo/${SESSION}.jsonl`
 const CONTEXT: Context = {
-  home: HOME,
+  configDir: `${HOME}/.claude`,
   os: 'darwin',
   selfUid: 501,
   selfHostPid: 100,
@@ -26,6 +26,7 @@ const result = (stdout: string): ProcessRunResult => ({
   isStderrTruncated: false,
 })
 const bytesOf = (text: string) => new TextEncoder().encode(text)
+const DAY_MS = 86_400_000
 const usage = (id: string, input: number, output: number, text = '') =>
   JSON.stringify({ type: 'assistant', message: { id, content: text, usage: { input_tokens: input, output_tokens: output } } })
 
@@ -40,6 +41,8 @@ function machine() {
     envs: new Map<number, string>(),
     cwds: new Map<number, string>(),
     transcript: '',
+    settings: {} as Readonly<Record<string, unknown>>,
+    now: 0,
   }
   const ran: string[][] = []
   const envsOf = (pids: number[]) => result(pids.flatMap(pid => state.envs.get(pid) ?? []).join('\n'))
@@ -68,7 +71,9 @@ function machine() {
       JSON.stringify({ pid: 100, sessionId: SESSION, cwd: `${HOME}/repo`, name: 'Live one', status: 'idle', procStart: STARTED }),
     stat: async () => ({ kind: 'file', size: bytesOf(state.transcript).length, mtimeMs: 0, isLink: false }),
     home: async () => HOME,
-    now: async () => 0,
+    configDir: async () => undefined,
+    settings: async () => state.settings,
+    now: async () => state.now,
   }
   return { state, ran, io }
 }
@@ -128,6 +133,30 @@ test('on Linux, reads processes through procps and environments and folders thro
   expect(probes.filter(probe => probe === 'ps eww' || probe.startsWith('lsof'))).toEqual([])
 })
 
+test('reads sessions and transcripts where CLAUDE_CONFIG_DIR keeps them', async () => {
+  const { ran, io } = machine()
+  const dir = '/Users/me/.claude-work'
+  const moved: Io = { ...io, exists: async path => path === `${dir}/sessions` }
+  const snap = await scan(moved, { ...CONTEXT, configDir: dir }, new Map(), new Map())
+  expect(snap.groups[0]?.session.name).toBe('Live one')
+  expect(ran.find(argv => argv[0] === 'find')?.[1]).toBe(`${dir}/projects`)
+})
+
+test('a deleted shell snapshot says its session ended only while younger than cleanupPeriodDays', async () => {
+  const { state, io } = machine()
+  const born = 1_791_000_000_000
+  const snapshot = `${HOME}/.claude/shell-snapshots/snapshot-zsh-${born}-abc123.sh`
+  state.ps.push(psLine(800, `/bin/zsh -c source ${snapshot} 2>/dev/null || true && eval 'sleep 600' < /dev/null`))
+  const zombiesAt = async (days: number, settings: Readonly<Record<string, unknown>>) => {
+    Object.assign(state, { now: born + days * DAY_MS, settings })
+    return (await scan(io, CONTEXT, new Map(), new Map())).zombies.map(zombie => zombie.root.pid)
+  }
+  expect(await zombiesAt(6, { cleanupPeriodDays: 7 })).toEqual([800])
+  // The retention sweep may have taken it while its session still runs.
+  expect(await zombiesAt(8, { cleanupPeriodDays: 7 })).toEqual([])
+  expect(await zombiesAt(8, {})).toEqual([800])
+})
+
 test('tells macOS from Linux, reads Linux cores and memory, and refuses any other system', async () => {
   const { io } = machine()
   const answering = (system: string): Io => ({
@@ -138,13 +167,15 @@ test('tells macOS from Linux, reads Linux cores and memory, and refuses any othe
       ),
   })
   expect(await contextOf(answering('Linux'))).toEqual({
-    home: HOME,
+    configDir: `${HOME}/.claude`,
     os: 'linux',
     selfHostPid: 4321,
     selfUid: 1000,
     machine: { cores: 8, memoryKb: 16303468 },
   })
   expect((await contextOf(answering('Darwin'))).os).toBe('darwin')
+  const moved = await contextOf({ ...answering('Darwin'), configDir: async () => '/Users/me/.claude-work' })
+  expect(moved.configDir).toBe('/Users/me/.claude-work')
   const refused = await contextOf(answering('MINGW64_NT-10.0')).then(
     () => null,
     (error: unknown) => error,

@@ -24,8 +24,11 @@ export type HostEntry = {
   procStart: string
 }
 
-/** What a process inherited from the Claude Code session that spawned it. */
-export type ProcEnv = { claudePid: number; sessionId: string | null }
+/**
+ * What a process inherited from the Claude Code session that spawned it: a Bash tool's
+ * child gets the host's pid, an MCP server the session id alone.
+ */
+export type ProcEnv = { claudePid: number; sessionId: string | null } | { claudePid: null; sessionId: string }
 
 export type Scan = {
   rows: PsRow[]
@@ -53,14 +56,17 @@ export type Os = 'darwin' | 'linux'
 
 /**
  * What differs between the systems: which binaries are the OS's or an app's
- * (never a session's child, never ours to signal), whose environment the OS
- * hides, and who adopts an orphan.
+ * (never a session's child, never ours to signal), the toolchains among them
+ * that sessions do run, whose environment the OS hides, and who adopts an orphan.
  */
-type Rules = { system: RegExp; hiddenEnv: RegExp | null; isReaper: (row: PsRow) => boolean }
-const SYSTEMD_USER = /^\/(usr\/)?lib\/systemd\/systemd --user\b/
+type Rules = { system: RegExp; toolchain: RegExp; hiddenEnv: RegExp | null; isReaper: (row: PsRow) => boolean }
+/** The user's systemd, wherever it is installed: NixOS keeps it in the store. */
+const SYSTEMD_USER = /^\S*\/systemd --user\b/
 const RULES: Record<Os, Rules> = {
   darwin: {
     system: /^\/(System|Applications|Library|usr\/libexec|usr\/sbin|sbin)\//,
+    toolchain:
+      /^\/(Library\/Java|Library\/Developer\/CommandLineTools|Library\/Frameworks\/Python\.framework|Applications\/Xcode[^/]*\.app\/Contents\/Developer)\//,
     // `ps eww` cannot read the environment of macOS's own binaries.
     hiddenEnv: /^\/(bin|usr\/bin)\//,
     // macOS has no subreapers: launchd adopts every orphan.
@@ -68,6 +74,7 @@ const RULES: Record<Os, Rules> = {
   },
   linux: {
     system: /^\/(usr\/lib|usr\/libexec|usr\/share|usr\/sbin|sbin|lib|opt|snap)\//,
+    toolchain: /^\/(usr\/lib\/jvm|usr\/lib\/dotnet|usr\/share\/dotnet)\//,
     // /proc/<pid>/environ is readable for every process of the same user.
     hiddenEnv: null,
     // An orphan goes to its nearest living subreaper, such as the user's systemd, or to init.
@@ -79,7 +86,7 @@ const PS_LINE =
   /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+(\w{3} \w{3}\s+\d+ [\d:]{8} \d{4})\s+(.*)$/
 /** This mod's own probes, which run as children of the session hosting it. */
 const PROBE =
-  /^(ps -axww |ps axww |ps eww |lsof -b -w -a -d cwd |find \S+\/\.claude\/projects |\/bin\/kill |\/bin\/sh -c echo |\/bin\/sh -c getconf |\/bin\/sh -c for p; do |tr \\0\\n |readlink \/proc\/\d+\/cwd$|id -u|uname -s|sysctl -n |\/bin\/sh -c \{ dd bs=1 skip=|dd bs=1 skip=\d+ count=0$|head -c 4194304$)/
+  /^(ps -axww |ps axww |ps eww |lsof -b -w -a -d cwd |find \S+\/projects -maxdepth 2 -name |\/bin\/kill |\/bin\/sh -c echo |\/bin\/sh -c getconf |\/bin\/sh -c for p; do |tr \\0\\n |readlink \/proc\/\d+\/cwd$|id -u|uname -s|sysctl -n |\/bin\/sh -c \{ dd bs=1 skip=|dd bs=1 skip=\d+ count=0$|head -c 4194304$)/
 const WORKTREE = /^(.*?\/\.claude\/worktrees\/[^/]+)(?:\/|$)/
 /**
  * A Bash tool shell, or a subshell it forked (which keeps its command line), sourcing its
@@ -88,6 +95,7 @@ const WORKTREE = /^(.*?\/\.claude\/worktrees\/[^/]+)(?:\/|$)/
 const SNAPSHOT =
   /^\/\S*\/(?:zsh|bash|sh) -c source (\/\S+\/shell-snapshots\/snapshot-(?:zsh|bash|sh)-\d+-[a-z0-9]+(?:-[\w-]+)?\.sh) /
 const COMMAND_MAX = 400
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 const squash = (text: string): string => text.trim().replace(/\s+/g, ' ')
 const basename = (path: string): string => path.slice(path.lastIndexOf('/') + 1)
@@ -97,6 +105,15 @@ const textOf = (value: unknown): string => (typeof value === 'string' ? value : 
 const numberOf = (value: unknown): number => (typeof value === 'number' ? value : 0)
 const sum = <T>(list: readonly T[], of: (item: T) => number): number =>
   list.reduce((total, item) => total + of(item), 0)
+const isWithin = (path: string, dir: string): boolean => path === dir || path.startsWith(`${dir}/`)
+
+/** A squashed lstart ("Tue Oct 6 14:13:53 2026") as milliseconds, to order two starts; NaN when it does not read. */
+function timeOf(started: string): number {
+  const [, month = '', day, clock = '', year] = started.split(' ')
+  const [hours, minutes, seconds] = clock.split(':').map(Number)
+  const index = MONTHS.indexOf(month)
+  return index < 0 ? Number.NaN : Date.UTC(Number(year), index, Number(day), hours, minutes, seconds)
+}
 
 /** A Claude Code host: the desktop's bundled binary, a native `claude`, or the npm CLI. */
 const isHostCommand = (command: string): boolean =>
@@ -104,7 +121,10 @@ const isHostCommand = (command: string): boolean =>
   command.includes('@anthropic-ai/claude-code/cli')
 
 const isCandidate = (row: PsRow, selfUid: number, rules: Rules): boolean =>
-  row.pid > 1 && row.uid === selfUid && !rules.system.test(row.command) && !PROBE.test(row.command)
+  row.pid > 1 &&
+  row.uid === selfUid &&
+  (!rules.system.test(row.command) || rules.toolchain.test(row.command)) &&
+  !PROBE.test(row.command)
 
 export function parsePs(stdout: string): PsRow[] {
   const rows: PsRow[] = []
@@ -147,15 +167,24 @@ export function parseHost(json: string): HostEntry | null {
   }
 }
 
-/** `ps eww` output: each line is the pid, the command, then the environment it was started with. */
-export function parseEnv(stdout: string): Map<number, ProcEnv> {
+/**
+ * Each line is the pid, the command on macOS (`ps eww`), then the environment the process
+ * started with. The command `commands` knows is cut off first, so an argument reading
+ * `CLAUDE_PID=…` never passes for the environment.
+ */
+export function parseEnv(stdout: string, commands: ReadonlyMap<number, string>): Map<number, ProcEnv> {
   const found = new Map<number, ProcEnv>()
   for (const line of stdout.split('\n')) {
-    const pid = /^\s*(\d+)\s/.exec(line)?.[1]
-    const claudePid = /\sCLAUDE_PID=(\d+)(?:\s|$)/.exec(line)?.[1]
-    if (pid === undefined || claudePid === undefined) continue
-    const sessionId = /\sCLAUDE_CODE_SESSION_ID=([\w-]+)(?:\s|$)/.exec(line)?.[1] ?? null
-    found.set(Number(pid), { claudePid: Number(claudePid), sessionId })
+    const head = /^\s*(\d+)\s/.exec(line)
+    if (head === null) continue
+    const pid = Number(head[1])
+    const rest = line.slice(head[0].length)
+    const command = commands.get(pid)
+    const env = ` ${command !== undefined && rest.startsWith(command) ? rest.slice(command.length) : rest}`
+    const claudePid = /\sCLAUDE_PID=(\d+)(?:\s|$)/.exec(env)?.[1]
+    const sessionId = /\sCLAUDE_CODE_SESSION_ID=([\w-]+)(?:\s|$)/.exec(env)?.[1]
+    if (claudePid !== undefined) found.set(pid, { claudePid: Number(claudePid), sessionId: sessionId ?? null })
+    else if (sessionId !== undefined) found.set(pid, { claudePid: null, sessionId })
   }
   return found
 }
@@ -200,6 +229,9 @@ export const worktreeOf = (path: string): string | null => WORKTREE.exec(path)?.
 
 export const snapshotOf = (command: string): string | null => SNAPSHOT.exec(command)?.[1] ?? null
 
+/** When Claude Code wrote a shell snapshot: the epoch milliseconds in its name. */
+export const bornOf = (snapshot: string): number => Number(/\/snapshot-[a-z]+-(\d+)-/.exec(snapshot)?.[1] ?? 0)
+
 function placeOf(path: string): string {
   const root = worktreeOf(path)
   if (root === null) return basename(path)
@@ -220,6 +252,7 @@ function toProc(row: PsRow, depth: number): Proc {
   return {
     pid: row.pid,
     ppid: row.ppid,
+    pgid: row.pgid,
     started: row.started,
     command: row.command.slice(0, COMMAND_MAX),
     label: labelOf(row.command),
@@ -292,7 +325,17 @@ function liveTrees(rows: readonly PsRow[], entries: readonly HostEntry[], selfUi
     for (const item of items) owner.set(item.row.pid, host.pid)
     order.set(host.pid, items)
   }
-  return { hosts, kids, owner, order }
+  // What a live session runs inside (a terminal, tmux, an editor) is in use, however it started:
+  // it is never a zombie, nor in one's tree.
+  const byPid = new Map(rows.map(row => [row.pid, row]))
+  for (const host of hosts.values()) {
+    let up = byPid.get(byPid.get(host.pid)?.ppid ?? 0)
+    for (let hop = 0; up !== undefined && up.pid > 1 && !rules.isReaper(up) && hop < 64; hop += 1) {
+      if (!hosts.has(up.pid) && !owner.has(up.pid)) owner.set(up.pid, host.pid)
+      up = byPid.get(up.ppid)
+    }
+  }
+  return { hosts, kids, owner, order, byPid }
 }
 
 /** Processes outside every live session's tree: the ones whose env and cwd are worth reading. */
@@ -318,24 +361,34 @@ export function candidatesOf(
 export function classify(scan: Scan): { groups: SessionGroup[]; zombies: Zombie[] } {
   const { rows, env, cwd } = scan
   const rules = RULES[scan.os]
-  const { hosts, kids, owner, order } = liveTrees(rows, scan.entries, scan.selfUid, rules)
+  const { hosts, kids, owner, order, byPid } = liveTrees(rows, scan.entries, scan.selfUid, rules)
   // Who adopts an orphan: launchd on macOS; init or the nearest subreaper on Linux.
   const reapers = new Set([1, ...rows.filter(row => rules.isReaper(row)).map(row => row.pid)])
-  const hostIn = (root: string) =>
-    [...hosts.values()].find(host => host.cwd === root || host.cwd.startsWith(`${root}/`))
+  // A session works in its own folder, and one in a repository's main checkout in its worktrees
+  // too, while they exist.
+  const hostIn = (root: string) => {
+    const repo = root.slice(0, root.indexOf('/.claude/worktrees/'))
+    const isGone = scan.missingWorktrees.has(root)
+    return [...hosts.values()].find(
+      host =>
+        isWithin(host.cwd, root) || (!isGone && isWithin(host.cwd, repo) && worktreeOf(host.cwd) === null),
+    )
+  }
 
   const claimOf = (row: PsRow): Claim | null => {
     const dir = cwd.get(row.pid) ?? ''
     const inherited = env.get(row.pid)
     if (inherited !== undefined) {
-      const host = hosts.get(inherited.claudePid)
-      const isSameSession =
-        host !== undefined &&
-        (host.session.sessionId === '' ||
-          inherited.sessionId === null ||
-          host.session.sessionId === inherited.sessionId)
-      return isSameSession
-        ? { kind: 'live', hostPid: inherited.claudePid }
+      // Its host is the one it names if that was already running when this process started: a
+      // process that reused the pid since started later. The session id names a Bash tool child's
+      // host no better, since /clear gives a running host a new one; an MCP server has no other.
+      const host =
+        inherited.claudePid === null
+          ? [...hosts.values()].find(one => one.session.sessionId === inherited.sessionId)
+          : hosts.get(inherited.claudePid)
+      const isItsHost = host !== undefined && !(timeOf(byPid.get(host.pid)?.started ?? '') > timeOf(row.started))
+      return isItsHost
+        ? { kind: 'live', hostPid: host.pid }
         : { kind: 'zombie', reason: 'session-ended', sessionId: inherited.sessionId, dir }
     }
     const snapshot = snapshotOf(row.command)
@@ -394,7 +447,6 @@ export function classify(scan: Scan): { groups: SessionGroup[]; zombies: Zombie[
     rules.hiddenEnv.test(row.command) &&
     !env.has(row.pid) &&
     !owner.has(row.pid)
-  const byPid = new Map(rows.map(row => [row.pid, row]))
   /** The orphan atop `row`, when every process between them is the same leftover; null otherwise. */
   const orphanOf = (row: PsRow): PsRow | null => {
     let current = row
@@ -488,22 +540,21 @@ export function totalsOf(groups: readonly SessionGroup[], zombies: readonly Zomb
 export const zombieTotal = (zombies: readonly Zombie[]): number =>
   zombies.reduce((total, zombie) => total + 1 + zombie.children.length, 0)
 
-/** How many rows a kill clears: the signalled pids, and the defunct children they leave to a reaper. */
-export function laidToRest(zombies: readonly Zombie[], roots: readonly number[], targets: readonly number[]): number {
-  return zombies
-    .filter(zombie => roots.includes(zombie.root.pid))
+/** How many rows a kill cleared: the signalled pids, and the defunct children they left to a reaper. */
+export function laidToRest(zombies: readonly Zombie[], signalled: ReadonlySet<number>): number {
+  const cleared = zombies
     .flatMap(zombie => [zombie.root, ...zombie.children])
-    .filter(proc => targets.includes(proc.pid) || (proc.isDefunct && targets.includes(proc.ppid))).length
+    .filter(proc => signalled.has(proc.pid) || (proc.isDefunct && signalled.has(proc.ppid)))
+  return new Set(cleared.map(proc => proc.pid)).size
 }
 
 /**
- * The living members of the chosen zombies' trees, deepest first, so no
+ * The living members of these zombies' trees, deepest first, so no
  * parent dies before its children and hands them to a reaper mid-kill.
  * A defunct process is already dead: it goes once its parent does.
  */
-export function killOrder(zombies: readonly Zombie[], roots: readonly number[]): Proc[] {
+export function killOrder(zombies: readonly Zombie[]): Proc[] {
   return zombies
-    .filter(zombie => roots.includes(zombie.root.pid))
     .flatMap(zombie => [zombie.root, ...zombie.children])
     .filter(proc => !proc.isDefunct)
     .sort((a, b) => b.depth - a.depth)

@@ -24,13 +24,13 @@ const row = (pid: number, ppid: number, command: string, extra: Partial<PsRow> =
   command,
   ...extra,
 })
-const entry = (pid: number, sessionId: string, cwd: string): HostEntry => ({
+const entry = (pid: number, sessionId: string, cwd: string, procStart = STARTED): HostEntry => ({
   pid,
   sessionId,
   cwd,
   name: `session at ${pid}`,
   status: 'idle',
-  procStart: STARTED,
+  procStart,
 })
 const scanOf = (rows: PsRow[], more: Partial<Scan> = {}): Scan => ({
   rows,
@@ -88,11 +88,50 @@ describe('classify', () => {
     expect(zombies.map(zombie => zombie.root.pid)).toEqual([300])
   })
 
-  test('a host pid now running another session does not adopt the old orphans', async () => {
-    const rows = [row(100, 1, HOST), row(300, 1, 'node /x/next dev')]
+  test('a session that reused a dead host’s pid does not adopt its orphans', async () => {
+    const later = 'Tue Oct 6 15:00:00 2026'
+    const rows = [row(100, 1, HOST, { started: later }), row(300, 1, 'node /x/next dev')]
     const env = inherited([[300, { claudePid: 100, sessionId: 'older-session' }]])
-    const { zombies } = classify(scanOf(rows, { env }))
+    const { zombies } = classify(scanOf(rows, { env, entries: [entry(100, LIVE_ID, ALIVE_TREE, later)] }))
     expect(zombies.map(zombie => zombie.root.pid)).toEqual([300])
+  })
+
+  test('after /clear gives its host a new session id, what the host started before is still its own', async () => {
+    const rows = [
+      row(100, 1, HOST),
+      row(300, 1, 'node /x/next dev', { started: 'Tue Oct 6 15:00:00 2026', pgid: 299 }),
+      row(301, 1, '/usr/bin/tail -f /tmp/next.log', { started: 'Tue Oct 6 15:00:00 2026', pgid: 299 }),
+    ]
+    const env = inherited([[300, { claudePid: 100, sessionId: 'id-before-clear' }]])
+    const { groups, zombies } = classify(scanOf(rows, { env }))
+    expect(zombies).toEqual([])
+    expect(groups[0]?.procs.map(proc => proc.pid)).toEqual([300])
+  })
+
+  test('an MCP server, which knows its session id alone, is a zombie once no host holds that id', async () => {
+    const rows = [row(100, 1, HOST), row(600, 1, 'node /x/mcp-server.js'), row(610, 1, 'node /x/other-mcp.js')]
+    const env = inherited([
+      [600, { claudePid: null, sessionId: 'dead-session' }],
+      [610, { claudePid: null, sessionId: LIVE_ID }],
+    ])
+    const { groups, zombies } = classify(scanOf(rows, { env }))
+    expect(zombies.map(zombie => [zombie.root.pid, zombie.reason])).toEqual([[600, 'session-ended']])
+    expect(groups[0]?.procs.map(proc => proc.pid)).toEqual([610])
+  })
+
+  test('what a live session runs inside is never a zombie, though a dead session started it', async () => {
+    const rows = [
+      row(100, 1, HOST),
+      row(500, 1, '/opt/homebrew/bin/tmux new-session -d -s dev'),
+      row(501, 500, '-zsh'),
+      row(502, 501, HOST),
+      row(503, 502, 'node /x/vite'),
+    ]
+    const entries = [entry(100, LIVE_ID, ALIVE_TREE), entry(502, '22222222-2222-2222-2222-222222222222', REPO)]
+    const env = inherited([[500, { claudePid: 999, sessionId: 'dead-session' }]])
+    const { groups, zombies } = classify(scanOf(rows, { env, entries }))
+    expect(zombies).toEqual([])
+    expect(groups.find(group => group.session.pid === 502)?.procs.map(proc => proc.pid)).toEqual([503])
   })
 
   test('an unregistered Claude Code process still protects its children', async () => {
@@ -123,6 +162,23 @@ describe('classify', () => {
       [402, 'worktree-deleted'],
       [401, 'no-live-session'],
     ])
+  })
+
+  test('a session in a repository’s main checkout keeps what it left in that repository’s worktrees, while they exist', async () => {
+    const gone = `${REPO}/.claude/worktrees/gone-7a8b9c`
+    const rows = [
+      row(100, 1, HOST),
+      row(800, 1, bashTool('snapshot-zsh-1791305381553-xhi34d.sh', 'while :; do sleep 5; done &')),
+      row(810, 1, '/bin/sleep 600'),
+      row(820, 1, '/bin/sleep 600'),
+    ]
+    const cwd = new Map([
+      [800, ALIVE_TREE],
+      [810, `${REPO}/.claude/worktrees/idle-4d5e6f`],
+      [820, gone],
+    ])
+    const scan = scanOf(rows, { cwd, entries: [entry(100, LIVE_ID, REPO)], missingWorktrees: new Set([gone]) })
+    expect(classify(scan).zombies.map(zombie => [zombie.root.pid, zombie.reason])).toEqual([[820, 'worktree-deleted']])
   })
 
   test('a person’s own shell in an abandoned worktree is left alone', async () => {
@@ -216,6 +272,27 @@ describe('classify', () => {
     expect(classify(scanOf(rows, { env, os: 'darwin' })).zombies).toEqual([])
   })
 
+  test('on Linux the user’s systemd adopts orphans wherever it is installed', async () => {
+    const rows = [
+      row(100, 1, HOST),
+      row(900, 1, '/nix/store/8f2f0b9n-systemd-256.8/lib/systemd/systemd --user'),
+      row(910, 900, 'node /x/next dev'),
+    ]
+    const env = inherited([[910, { claudePid: 999, sessionId: 'dead-session' }]])
+    expect(classify(scanOf(rows, { env, os: 'linux' })).zombies.map(zombie => zombie.root.pid)).toEqual([910])
+  })
+
+  test('a leftover on a toolchain kept among system folders is still found', async () => {
+    const gradle = 'org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10'
+    const env = inherited([[700, { claudePid: 999, sessionId: 'dead-session' }]])
+    const on = (os: 'darwin' | 'linux', java: string) =>
+      classify(scanOf([row(100, 1, HOST), row(700, 1, `${java} -Xmx2g ${gradle}`)], { env, os })).zombies.map(
+        zombie => zombie.root.pid,
+      )
+    expect(on('darwin', '/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home/bin/java')).toEqual([700])
+    expect(on('linux', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java')).toEqual([700])
+  })
+
   test('a registered session counts wherever its binary is installed', async () => {
     const rows = [row(100, 1, '/opt/claude-code/claude'), row(300, 1, 'node /x/next dev')]
     const env = inherited([[300, { claudePid: 100, sessionId: LIVE_ID }]])
@@ -269,21 +346,20 @@ describe('killing', () => {
 
   test('goes deepest first and skips the defunct', async () => {
     const { zombies } = classify(scanOf(rows, { env }))
-    expect(killOrder(zombies, [300]).map(proc => proc.pid)).toEqual([301, 300])
-    expect(killOrder(zombies, [999])).toEqual([])
+    expect(killOrder(zombies).map(proc => proc.pid)).toEqual([301, 300])
   })
 
   test('counts every row, the defunct included, which a kill clears along with its parent', async () => {
     const { zombies } = classify(scanOf(rows, { env }))
     expect(zombieTotal(zombies)).toBe(3)
-    expect(laidToRest(zombies, [300], [301, 300])).toBe(3)
+    expect(laidToRest(zombies, new Set([301, 300]))).toBe(3)
     // 301 was spared (it changed since the scan), so its defunct child stays.
-    expect(laidToRest(zombies, [300], [300])).toBe(1)
+    expect(laidToRest(zombies, new Set([300]))).toBe(1)
   })
 
   test('only signals a pid that still names the same process', async () => {
     const { zombies } = classify(scanOf(rows, { env }))
-    const planned = killOrder(zombies, [300])
+    const planned = killOrder(zombies)
     expect(stillSame(planned, rows, guard)).toEqual([301, 300])
     const restarted = rows.map(one => (one.pid === 301 ? { ...one, started: 'Wed Oct 7 09:00:00 2026' } : one))
     expect(stillSame(planned, restarted, guard)).toEqual([300])
@@ -324,9 +400,23 @@ describe('parsing', () => {
   test('reads the inherited session from ps eww', async () => {
     const env = parseEnv(
       '16505 node jest.js PATH=/bin CLAUDE_PID=4745 CLAUDE_CODE_SESSION_ID=0e27d97f-ad7a-464e-ac13-81fa72123602 X=1\n16506 node plain.js PATH=/bin\n',
+      new Map(),
     )
     expect(env.get(16505)).toEqual({ claudePid: 4745, sessionId: '0e27d97f-ad7a-464e-ac13-81fa72123602' })
     expect(env.has(16506)).toBe(false)
+  })
+
+  test('reads the environment after the command, so an argument cannot pass for it', async () => {
+    const commands = new Map([
+      [700, 'env CLAUDE_PID=1 node x.js'],
+      [600, 'node /x/mcp-server.js'],
+    ])
+    const env = parseEnv(
+      '  700 env CLAUDE_PID=1 node x.js PATH=/bin\n  600 node /x/mcp-server.js PATH=/bin CLAUDE_CODE_SESSION_ID=dead-session CLAUDECODE=1\n',
+      commands,
+    )
+    expect(env.has(700)).toBe(false)
+    expect(env.get(600)).toEqual({ claudePid: null, sessionId: 'dead-session' })
   })
 
   test('counts each API response once', async () => {

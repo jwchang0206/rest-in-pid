@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 import type { On, PaneOpenArgs, ProcessRunResult, UiOpenResult } from 'claude-code'
 
 const HOME = '/Users/me'
@@ -54,15 +55,19 @@ const ok = (stdout: string): { value: ProcessRunResult } => ({
   value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
 })
 
-/** Stands in for the host: a live session (100) and a dead session's orphan (300) with its child (301). */
+/**
+ * Stands in for the host: a live session (100) and a dead session's orphan (300) with its child
+ * (301). A test moves the process table on through `world.ps`.
+ */
 function host(on: On, seat: UiOpenResult = { isPlaced: true }) {
   const ran: string[][] = []
   const opened: PaneOpenArgs[] = []
+  const world = { ps: PS }
   on('process.run', (_, e) => {
     ran.push([...e.argv])
     const [command, first] = e.argv
     if (command === '/bin/sh' && e.argv[2]?.startsWith('echo')) return ok('100 501 Darwin\n')
-    if (command === 'ps' && first === '-axww') return ok(PS)
+    if (command === 'ps' && first === '-axww') return ok(world.ps)
     if (command === 'ps' && first === 'eww') return ok(ENV)
     if (command === 'lsof') return ok(CWD)
     return ok('')
@@ -70,6 +75,7 @@ function host(on: On, seat: UiOpenResult = { isPlaced: true }) {
   on('fs.exists', (_, e) => ({ value: e.path === `${HOME}/.claude/sessions` }))
   on('fs.list', () => ({ value: [{ name: '100.json', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }))
   on('fs.read', () => ({ value: REGISTRY }))
+  on('settings.read', () => ({ value: {} }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('ui.open', (_, e) => {
@@ -80,8 +86,17 @@ function host(on: On, seat: UiOpenResult = { isPlaced: true }) {
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
   mock.env(on, { HOME })
-  mock.clock(on)
-  return { ran, opened }
+  const clock = mock.clock(on)
+  return { ran, opened, world, clock }
+}
+
+/** The board on the terminal, the zombies section open. */
+async function board($: Engine) {
+  await $.session.start({ cwd: `${HOME}/repo`, surface: 'terminal', isInteractive: true })
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'toggle-zombies' })
+  return ui
 }
 
 test('sections start closed, open on their chevron, and a dead session’s orphan is killed on press', async ($, on) => {
@@ -116,6 +131,33 @@ test('sections start closed, open on their chevron, and a dead session’s orpha
   await ui.press({ key: 'kill-300' })
   expect(ran).toContainEqual(['/bin/kill', '-TERM', '301', '300'])
   expect(ran.some(argv => argv[0] === '/bin/kill' && argv.includes('100'))).toBe(false)
+  await ui.unmount()
+})
+
+test('Kill takes the tree as it runs when pressed, and its SIGKILL pass what rose in the group meanwhile', async ($, on) => {
+  const { ran, world, clock } = host(on)
+  const ui = await board($)
+  // A worker 301 spawned after the board was drawn.
+  world.ps = `${PS}\n  302   301   290   501 S      0.0   1000 Tue Oct  6 15:00:02 2026 node ${GONE}/worker.js --child`
+  await ui.press({ key: 'kill-300' })
+  expect(ran).toContainEqual(['/bin/kill', '-TERM', '302', '301', '300'])
+  // 301 shrugged SIGTERM off, and 303 rose in its group while 300 went down.
+  world.ps = [
+    `  100     1    99   501 S      0.3  90000 Tue Oct  6 14:13:53 2026 ${HOST}`,
+    `  301     1   290   501 S      0.1  50000 Tue Oct  6 15:00:01 2026 node ${GONE}/node_modules/next/worker.js`,
+    `  303     1   290   501 S      0.0   1000 Tue Oct  6 15:00:03 2026 node ${GONE}/cleanup.js`,
+  ].join('\n')
+  await clock.advance(2_000)
+  expect(ran).toContainEqual(['/bin/kill', '-KILL', '301', '303'])
+  await ui.unmount()
+})
+
+test('Kill spares a zombie that a live session has started inside since the board was drawn', async ($, on) => {
+  const { ran, world } = host(on)
+  const ui = await board($)
+  world.ps = `${PS}\n  302   301   302   501 S      0.0   1000 Tue Oct  6 15:10:00 2026 ${HOST}`
+  await ui.press({ key: 'kill-300' })
+  expect(ran.some(argv => argv[0] === '/bin/kill')).toBe(false)
   await ui.unmount()
 })
 

@@ -118,9 +118,13 @@ claude plugin install rest-in-pid@jwchang0206
 The plugin then loads in Claude Code in the terminal and in the Code tab of
 the Desktop app, which read the same settings. Start a new session, or run
 `/reload-plugins` in one that was already open.
-`claude plugin update rest-in-pid@jwchang0206` fetches a new release once the
-`version` in `plugin.json` goes up. [CHANGES.md](CHANGES.md) says what each
-release changed.
+A new release arrives once the `version` in `plugin.json` goes up
+([CHANGES.md](CHANGES.md) says what each one changed). To take it:
+
+```bash
+claude plugin marketplace update jwchang0206
+claude plugin update rest-in-pid@jwchang0206
+```
 
 Mods need Claude Code 2.1.287 or later in the terminal, or 2.1.286 in the Desktop app.
 

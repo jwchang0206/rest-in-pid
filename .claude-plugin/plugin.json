@@ -1,0 +1,11 @@
+{
+  "name": "rest-in-pid",
+  "version": "1.0.0",
+  "displayName": "Rest in PID",
+  "description": "Track the processes Claude Code sessions and worktrees spawn, and lay their zombies to rest.",
+  "author": { "name": "Jeong Woo Chang" },
+  "license": "MIT",
+  "homepage": "https://github.com/jwchang0206/rest-in-pid",
+  "repository": "https://github.com/jwchang0206/rest-in-pid",
+  "types": "./types/index.d.ts"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "jwchang0206",
+  "description": "Claude Code mods by Jeong Woo Chang.",
+  "owner": {
+    "name": "Jeong Woo Chang"
+  },
+  "plugins": [
+    {
+      "name": "rest-in-pid",
+      "source": "./",
+      "description": "Track the processes Claude Code sessions and worktrees spawn, and lay their zombies to rest."
+    }
+  ]
+}

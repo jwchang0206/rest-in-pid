@@ -14,6 +14,8 @@ const PANE = 'rest-in-pid'
 const TICK_MS = 5_000
 /** While the pane is closed only every SLOW_TICKS-th tick scans: enough to keep the status line honest. */
 const SLOW_TICKS = 6
+/** While the band counts zombies, how often one `ps` checks that they still run. */
+const WATCH_MS = 2_000
 const ARMED_MS = 4_000
 /** How long SIGTERM gets before SIGKILL follows. */
 const GRACE_MS = 2_000
@@ -426,6 +428,16 @@ export const register: Register = on => {
         if (isOpen || ticks % SLOW_TICKS === 0) await refresh()
       })()
     })
+    // The band shows the count this session's last scan made. Once a zombie it counts is gone,
+    // killed in another session or by hand, scan again at once rather than at the slow tick.
+    $.clock.every(WATCH_MS, () => {
+      void (async () => {
+        if (context === undefined || (await read($, zombieCount)) === 0) return
+        const counted = (await read($, snapshot))?.zombies.flatMap(zombie => [zombie.root, ...zombie.children]) ?? []
+        const running = new Set((await readPs(io, context.os)).map(row => `${row.pid}:${row.started}`))
+        if (counted.some(proc => !running.has(`${proc.pid}:${proc.started}`))) await refresh()
+      })()
+    })
     $.clock.after(1_000, () => void refresh())
     return next(e)
   })
@@ -500,6 +512,7 @@ export const register: Register = on => {
               const opened = await $.ui.open({ id: PANE, title: 'Rest in PID', focus: true })
               await update($, isPlaced, () => opened.isPlaced)
               if (!opened.isPlaced) $.ui.toast(`The pane cannot open here (${opened.reason}). Run /rest-in-pid instead.`)
+              await actions?.refresh()
             })()
           }
         />

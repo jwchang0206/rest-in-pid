@@ -1,5 +1,13 @@
 # Changes
 
+## 1.0.3
+
+- The band above the prompt clears within two seconds once the zombies it
+  counts are gone, laid to rest in another session or by hand. It used to
+  wait for the next background scan, up to 30 seconds while the board is
+  closed.
+- Opening the graveyard from the band scans right away.
+
 ## 1.0.2
 
 - Finds a dead session's processes in a worktree again while another

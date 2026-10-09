@@ -16,7 +16,9 @@ Run `/rest-in-pid` to open the board:
   processes it spawned, with CPU and memory for each.
 
 While zombies exist, a band above the prompt counts them and opens the
-board, and a toast announces each new one.
+board, and a toast announces each new one. The band checks every two seconds
+that the zombies it counts still run, so it clears as soon as they are laid
+to rest, in this session, another one, or by hand.
 
 ![A band above the prompt reading "2 zombies left behind by ended sessions", with an Open graveyard button](docs/band.png)
 

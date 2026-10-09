@@ -161,6 +161,26 @@ test('Kill spares a zombie that a live session has started inside since the boar
   await ui.unmount()
 })
 
+test('the band clears within seconds once its zombies die elsewhere, before the slow scan comes round', async ($, on) => {
+  const { world, clock } = host(on)
+  // What the engine draws when no plugin fills the band.
+  on('ui.render', { component: 'AbovePrompt' }, (kit, e) => {
+    const { Box } = kit.ui.resolve(e)
+    return <Box key="engine-band" />
+  })
+  await $.session.start({ cwd: `${HOME}/repo`, surface: 'desktop', isInteractive: true })
+  await clock.advance(1_000)
+  const before = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await before.find({ key: 'open-graveyard' })).toBeDefined()
+  await before.unmount()
+  // Another session laid 300 and 301 to rest.
+  world.ps = PS.split('\n').slice(0, 2).join('\n')
+  await clock.advance(2_000)
+  const after = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await after.find({ key: 'open-graveyard' })).toBeUndefined()
+  await after.unmount()
+})
+
 test('the band above the prompt counts every zombie process and opens the graveyard', async ($, on) => {
   const { opened } = host(on)
   await $.session.start({ cwd: `${HOME}/repo`, surface: 'desktop', isInteractive: true })

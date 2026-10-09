@@ -354,9 +354,11 @@ export function candidatesOf(
 
 /**
  * Sorts every process into a live session or a zombie. Ancestry decides
- * first, then the inherited CLAUDE_PID, then a shell snapshot its session
- * deleted, and the worktree a process sits in last, since a session often
- * works outside its own folder. A process with none of these follows its group.
+ * first, then what a process carries (the session it inherited, a shell
+ * snapshot its session deleted), and the worktree a process sits in last,
+ * only where nothing in its tree or Bash command carries any of that, since
+ * a session often works outside its own folder. A process with none of these
+ * follows its group.
  */
 export function classify(scan: Scan): { groups: SessionGroup[]; zombies: Zombie[] } {
   const { rows, env, cwd } = scan
@@ -375,7 +377,8 @@ export function classify(scan: Scan): { groups: SessionGroup[]; zombies: Zombie[
     )
   }
 
-  const claimOf = (row: PsRow): Claim | null => {
+  // What a process carries: the session it inherited, or a shell snapshot its session deleted.
+  const evidenceOf = (row: PsRow): Claim | null => {
     const dir = cwd.get(row.pid) ?? ''
     const inherited = env.get(row.pid)
     if (inherited !== undefined) {
@@ -395,9 +398,12 @@ export function classify(scan: Scan): { groups: SessionGroup[]; zombies: Zombie[
     if (snapshot !== null && scan.missingSnapshots.has(snapshot)) {
       return { kind: 'zombie', reason: 'session-ended', sessionId: null, dir }
     }
-    // Without the env, only an orphan may be judged by its folder: a person's own shell in a
-    // worktree always has a live parent (a terminal, login, tmux, an editor).
-    const root = reapers.has(row.ppid) ? worktreeOf(dir) : null
+    return null
+  }
+  // Where it sits. Without the env, only an orphan may be judged by its folder: a person's own
+  // shell in a worktree always has a live parent (a terminal, login, tmux, an editor).
+  const folderClaimOf = (row: PsRow): Claim | null => {
+    const root = reapers.has(row.ppid) ? worktreeOf(cwd.get(row.pid) ?? '') : null
     if (root === null) return null
     const host = hostIn(root)
     if (host !== undefined) return { kind: 'live', hostPid: host.pid }
@@ -405,14 +411,20 @@ export function classify(scan: Scan): { groups: SessionGroup[]; zombies: Zombie[
     return { kind: 'zombie', reason, sessionId: null, dir: root }
   }
 
-  const undead = new Map<number, Extract<Claim, { kind: 'zombie' }>>()
+  // A process group is one Bash tool command, and POSIX keeps a group's id from reuse while any
+  // member lives.
+  const jobs = new Map<number, PsRow[]>()
   for (const row of rows) {
-    if (owner.has(row.pid) || hosts.has(row.pid) || !isCandidate(row, scan.selfUid, rules)) continue
-    const claim = claimOf(row)
-    if (claim === null) continue
+    const job = jobs.get(row.pgid)
+    if (job === undefined) jobs.set(row.pgid, [row])
+    else job.push(row)
+  }
+
+  const undead = new Map<number, Extract<Claim, { kind: 'zombie' }>>()
+  const settle = (row: PsRow, claim: Claim) => {
     if (claim.kind === 'zombie') {
       undead.set(row.pid, claim)
-      continue
+      return
     }
     // Detached from its session's tree (adopted by a reaper), but the session still runs.
     const items = [{ row, depth: 0 }, ...descend(row.pid, kids, hosts, 1)].filter(
@@ -421,16 +433,25 @@ export function classify(scan: Scan): { groups: SessionGroup[]; zombies: Zombie[
     for (const item of items) owner.set(item.row.pid, claim.hostPid)
     order.get(claim.hostPid)?.push(...items)
   }
-
-  // A process group is one Bash tool command, and POSIX keeps a group's id from reuse while any
-  // member lives. A member with no evidence of its own (macOS hides the env of its own binaries)
-  // goes with a dead sibling, unless something in the group is still owned or not ours.
-  const jobs = new Map<number, PsRow[]>()
+  const isOpen = (row: PsRow) => !owner.has(row.pid) && !hosts.has(row.pid) && isCandidate(row, scan.selfUid, rules)
   for (const row of rows) {
-    const job = jobs.get(row.pgid)
-    if (job === undefined) jobs.set(row.pgid, [row])
-    else job.push(row)
+    const claim = isOpen(row) ? evidenceOf(row) : null
+    if (claim !== null) settle(row, claim)
   }
+  // The folder decides last, and only for a process whose tree and Bash command carry no evidence:
+  // a session in the repository's main checkout must not adopt what a dead session's processes
+  // prove dead.
+  const isSettled = (pid: number) => owner.has(pid) || undead.has(pid)
+  for (const row of rows) {
+    if (!isOpen(row) || undead.has(row.pid)) continue
+    const near = [...descend(row.pid, kids, hosts, 1).map(item => item.row), ...(jobs.get(row.pgid) ?? [])]
+    if (near.some(one => one.pid !== row.pid && isSettled(one.pid))) continue
+    const claim = folderClaimOf(row)
+    if (claim !== null) settle(row, claim)
+  }
+
+  // A member of a group with no evidence of its own (macOS hides the env of its own binaries)
+  // goes with a dead sibling, unless something in the group is still owned or not ours.
   for (const job of jobs.values()) {
     const claim = job.map(row => undead.get(row.pid)).find(found => found !== undefined)
     const isLeftover = job.every(

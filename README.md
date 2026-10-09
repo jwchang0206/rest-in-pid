@@ -33,11 +33,12 @@ it belongs to the running session holding that id. It is a zombie when:
   (the pid is gone or was reused, or no running session holds the id), or
   it is a Bash tool shell still sourcing a shell snapshot its session
   deleted (Claude Code deletes a session's snapshot when the session exits);
-- **no live session**: nothing says which session started it, it sits in a
+- **no live session**: neither it nor anything in its tree or its Bash
+  command says which session started it, it sits in a
   `.claude/worktrees/<name>` folder, and no running session works there or
   in that repository's main checkout;
-- **worktree deleted**: nothing says which session started it, and the
-  worktree folder it sits in no longer exists.
+- **worktree deleted**: nothing says which session started it, as above, and
+  the worktree folder it sits in no longer exists.
 
 What a live session runs inside, such as its terminal, a tmux server or an
 editor, is never a zombie, even when a session that has since ended started
@@ -59,8 +60,10 @@ zombie: one launchd adopted on macOS, or init or the user's systemd on Linux.
 A shell in your own terminal or editor never is.
 
 What it cannot see: a lone macOS binary whose session left no other trace,
-such as `sleep 600 &` with no sibling, or a shell loop from a session that
-crashed, since a crash leaves the snapshot behind.
+such as `sleep 600 &` with no sibling; a shell loop from a session that
+crashed, since a crash leaves the snapshot behind; and such traceless
+leftovers in a worktree while a session runs in that repository's main
+checkout, since that session may well have started them.
 
 Its descendants are part of its tree, and every process in it counts. A
 `<defunct>` (Unix zombie) process counts too but is never signalled: it is

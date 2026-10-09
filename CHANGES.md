@@ -1,5 +1,14 @@
 # Changes
 
+## 1.0.2
+
+- Finds a dead session's processes in a worktree again while another
+  session runs in the repository's main checkout. 1.0.1 let that session
+  adopt the whole tree by its folder, though the processes in it carried the
+  dead session's `CLAUDE_PID`, so zombies such as the dev servers a Remote
+  Control session left behind went unseen. What a process carries now
+  decides before the folder it sits in.
+
 ## 1.0.1
 
 - Kill never takes down a live session: what a session runs inside (its

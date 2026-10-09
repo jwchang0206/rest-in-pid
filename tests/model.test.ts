@@ -181,6 +181,28 @@ describe('classify', () => {
     expect(classify(scan).zombies.map(zombie => [zombie.root.pid, zombie.reason])).toEqual([[820, 'worktree-deleted']])
   })
 
+  test('a session in the main checkout does not adopt a worktree tree that a dead session’s env proves dead', async () => {
+    // A Remote Control session left its dev server running in its worktree, and never deleted its snapshot.
+    const bridge = `${REPO}/.claude/worktrees/bridge-cse_019vYyocy1`
+    const rows = [
+      row(100, 1, HOST),
+      row(650, 1, bashTool('snapshot-zsh-1791490914666-r15oad.sh', 'cd apps/backend && pnpm dev'), { stat: 'Ss' }),
+      row(651, 650, 'node /x/pnpm.cjs dev', { pgid: 650 }),
+      row(652, 651, 'node /x/server.js', { pgid: 650 }),
+    ]
+    const dead = { claudePid: 9895, sessionId: 'dead-session' }
+    const env = inherited([
+      [651, dead],
+      [652, dead],
+    ])
+    const cwd = new Map([650, 651, 652].map(pid => [pid, `${bridge}/apps/backend`]))
+    const { groups, zombies } = classify(scanOf(rows, { env, cwd, entries: [entry(100, LIVE_ID, REPO)] }))
+    expect(zombies.map(zombie => [zombie.root.pid, zombie.reason, ...zombie.children.map(child => child.pid)])).toEqual([
+      [650, 'session-ended', 651, 652],
+    ])
+    expect(groups[0]?.procs).toEqual([])
+  })
+
   test('a person’s own shell in an abandoned worktree is left alone', async () => {
     const rows = [
       row(100, 1, HOST),

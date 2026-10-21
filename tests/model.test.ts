@@ -7,6 +7,9 @@ const UID = 501
 const STARTED = 'Tue Oct 6 14:13:53 2026'
 const HOST =
   '/Users/me/Library/Application Support/Claude/claude-code/2.1.288/abc/claude.app/Contents/MacOS/claude --output-format stream-json'
+/** A session on the npm package's native binary, as Remote Control and npx start it. */
+const NATIVE =
+  '/Users/me/.npm/_npx/becf7b9e49303068/node_modules/@anthropic-ai/claude-code/bin/claude.exe --print --sdk-url https://api.anthropic.com/v1/code/sessions/cse_1'
 const REPO = '/Users/me/repo'
 const ALIVE_TREE = `${REPO}/.claude/worktrees/alive-1a2b3c`
 const LIVE_ID = '11111111-1111-1111-1111-111111111111'
@@ -139,6 +142,12 @@ describe('classify', () => {
     const env = inherited([[310, { claudePid: 150, sessionId: 'unknown-session' }]])
     const { zombies } = classify(scanOf(rows, { entries: [], env }))
     expect(zombies).toEqual([])
+  })
+
+  test('an unregistered session on the npm package’s native binary still protects its children', async () => {
+    const rows = [row(160, 1, NATIVE), row(320, 1, 'node /x/next dev')]
+    const env = inherited([[320, { claudePid: 160, sessionId: 'unknown-session' }]])
+    expect(classify(scanOf(rows, { entries: [], env })).zombies).toEqual([])
   })
 
   test('without an inherited env, the worktree a process sits in decides', async () => {
@@ -395,6 +404,8 @@ describe('killing', () => {
     if (zombie === undefined) throw new Error('expected a zombie')
     const asHost = rows.map(one => (one.pid === 300 ? { ...one, command: HOST } : one))
     expect(stillSame([{ ...zombie.root, command: HOST }], asHost, guard)).toEqual([])
+    const asNative = rows.map(one => (one.pid === 300 ? { ...one, command: NATIVE } : one))
+    expect(stillSame([{ ...zombie.root, command: NATIVE }], asNative, guard)).toEqual([])
     const asRoot = rows.map(one => (one.pid === 300 ? { ...one, uid: 0 } : one))
     expect(stillSame([zombie.root], asRoot, guard)).toEqual([])
     expect(stillSame([zombie.root], rows, { selfUid: UID, protectedPids: new Set([300]) })).toEqual([])

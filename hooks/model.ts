@@ -115,9 +115,12 @@ function timeOf(started: string): number {
   return index < 0 ? Number.NaN : Date.UTC(Number(year), index, Number(day), hours, minutes, seconds)
 }
 
-/** A Claude Code host: the desktop's bundled binary, a native `claude`, or the npm CLI. */
+/**
+ * A Claude Code host: the desktop's bundled binary, a native `claude`, the npm CLI, or the npm package's
+ * native `claude.exe`, which Remote Control and npx run by its full path.
+ */
 const isHostCommand = (command: string): boolean =>
-  basename(squash(command.split(' -')[0] ?? '')) === 'claude' ||
+  ['claude', 'claude.exe'].includes(basename(squash(command.split(' -')[0] ?? ''))) ||
   command.includes('@anthropic-ai/claude-code/cli')
 
 const isCandidate = (row: PsRow, selfUid: number, rules: Rules): boolean =>

@@ -1,5 +1,14 @@
 # Changes
 
+## 1.0.4
+
+- Recognizes a Claude Code session running on the npm package's native
+  binary (`@anthropic-ai/claude-code/bin/claude.exe`), which Remote Control
+  and `npx` start by its full path. When such a session had no file in Claude
+  Code's `sessions` folder, the dev servers and other processes it started
+  could show up as zombies, and Kill's last check did not take it for a
+  session host.
+
 ## 1.0.3
 
 - The band above the prompt clears within two seconds once the zombies it

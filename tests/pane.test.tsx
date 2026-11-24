@@ -217,3 +217,26 @@ test('where no pane can be seated, the command’s own row draws the board', asy
   expect(await ui.find({ key: 'kill-300' })).toBeDefined()
   await ui.unmount()
 })
+
+test('a terminal’s board reads on any theme: frames without a fill, text in theme colours, never faint', async ($, on) => {
+  host(on)
+  const ui = await board($)
+  await ui.press({ key: 'toggle-sessions' })
+  for (const key of ['zombie-300', 'session-100']) {
+    const card = await ui.find({ key })
+    expect(card?.props.borderColor).toBeDefined()
+    expect(card?.props.backgroundColor).toBeUndefined()
+  }
+  // A fixed colour, or a terminal's own faint, falls under 3:1 on some theme.
+  const texts = await ui.findAll({ type: 'Text' })
+  expect(texts.length).toBeGreaterThan(5)
+  for (const text of texts) {
+    expect(text.props.dimColor).toBeFalsy()
+    expect([undefined, 'inactive', 'error']).toContain(text.props.color)
+  }
+  await ui.unmount()
+  // The desktop inks its drawn text dark, for the fill behind it.
+  const drawn = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  for (const key of ['zombie-300', 'session-100']) expect((await drawn.find({ key }))?.props.backgroundColor).toBeDefined()
+  await drawn.unmount()
+})

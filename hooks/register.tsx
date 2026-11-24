@@ -3,7 +3,7 @@ import type { Elements, Register, RenderElement, RenderSurface } from 'claude-co
 
 import type { Proc, SessionGroup, Snapshot, Zombie } from '../types'
 import { count, killOrder, laidToRest, memory, stillSame, zombieTotal } from './model'
-import { clip, header, icons, NIGHT, note, notice, pill, screen, strip, table as processTable } from './panels'
+import { clip, header, icons, note, notice, pill, screen, strip, table as processTable } from './panels'
 import type { Drawing, Line } from './panels'
 import { contextOf, readPs, scan } from './scan'
 import type { Context, Envs, Io, Readings } from './scan'
@@ -44,11 +44,22 @@ const CARD = {
   zombie: { borderColor: '#f2a7bf', backgroundColor: '#fff3f6' },
   session: { borderColor: '#cdc0f2', backgroundColor: '#f8f5ff' },
 }
+/**
+ * A terminal's cards keep only the frame: their text takes the person's theme colours, which a pastel
+ * fill washes out on a dark theme. The frames are the pastels deepened to stand at 3:1 or more on a
+ * light theme and a dark one alike. The drawn surfaces ink their text dark themselves, for the fill.
+ */
+const FRAME = {
+  zombie: { borderColor: '#d45c88' },
+  session: { borderColor: '#8977d0' },
+}
 
 type Common = Pick<Elements['desktop'], 'Box' | 'Text' | 'Button'>
 type Table = Elements[keyof Elements]
 /** How a surface draws the board's parts: drawings where it has Svg, padded text where it is a terminal. */
 type Kit = {
+  /** How each kind of card is framed and filled. */
+  card: Record<keyof typeof CARD, { borderColor: string; backgroundColor?: string }>
   screen: (snap: Snapshot) => RenderElement
   /** A section's heading, which opens and closes it. */
   toggle: (section: Section, label: string, isOpen: boolean) => RenderElement
@@ -121,7 +132,7 @@ function zombieCard(els: Common, kit: Kit, zombie: Zombie, view: View, act: Acti
   const procs = [root, ...children]
   const shown = procs.slice(0, ROWS_SHOWN)
   return (
-    <Box key={`zombie-${root.pid}`} flexDirection="column" borderStyle="round" {...CARD.zombie} paddingX={1}>
+    <Box key={`zombie-${root.pid}`} flexDirection="column" borderStyle="round" {...kit.card.zombie} paddingX={1}>
       <Box flexDirection="row" justifyContent="space-between" alignItems="center">
         {kit.header(icons.zombie, zombie.session?.name ?? 'Unknown session', `${origin(zombie)} · ${zombie.place}`)}
         <Box width={ACTION_CELLS} justifyContent="flex-end">
@@ -143,7 +154,7 @@ function sessionCard(els: Common, kit: Kit, group: SessionGroup): RenderElement 
   const shown = procs.slice(0, ROWS_SHOWN)
   const subtitle = `${session.place} · ${count(session.tokensIn)} / ${count(session.tokensOut)} tokens`
   return (
-    <Box key={`session-${session.pid}`} flexDirection="column" borderStyle="round" {...CARD.session} paddingX={1}>
+    <Box key={`session-${session.pid}`} flexDirection="column" borderStyle="round" {...kit.card.session} paddingX={1}>
       <Box flexDirection="row" justifyContent="space-between" alignItems="center">
         {kit.header(icons.terminal, session.name, subtitle)}
         <Box width={ACTION_CELLS} justifyContent="flex-end">
@@ -197,6 +208,7 @@ function kitOf(surface: RenderSurface, table: Table, columns: number, act: Actio
       <Svg source={drawing.source} width={drawing.width} height={drawing.height} alt={drawing.alt} />
     )
     return {
+      card: CARD,
       // The screen alone fills the pane's width, scaling as one picture.
       screen: snap => {
         const picture = screen(snap)
@@ -233,7 +245,10 @@ function kitOf(surface: RenderSurface, table: Table, columns: number, act: Actio
       fraction <= 0 ? 0 : Math.max(1, Math.min(TERMINAL_SEGMENTS, Math.round(fraction * TERMINAL_SEGMENTS)))
     return '▰'.repeat(lit) + '▱'.repeat(TERMINAL_SEGMENTS - lit)
   }
+  // Secondary text is in the theme's own `inactive` grey, 4.4:1 or more on every common theme, rather than
+  // faint, which each terminal dims its own way and some to under 3:1.
   return {
+    card: FRAME,
     screen: snap => {
       const { totals, machine } = snap
       const cells = raster(title())
@@ -242,14 +257,12 @@ function kitOf(surface: RenderSurface, table: Table, columns: number, act: Actio
           {'Raster' in table && columns >= cells.columns ? (
             <table.Raster key="title" {...cells} />
           ) : (
-            <Text bold color={NIGHT.value}>
-              REST IN PID
-            </Text>
+            <Text bold>REST IN PID</Text>
           )}
           <Text>{`SESSIONS ${snap.groups.length}  PROCESSES ${totals.procs}  ZOMBIES ${zombieTotal(snap.zombies)}`}</Text>
           <Text>{`CPU ${bar(share(totals.cpu, machine.cores * 100))} ${totals.cpu.toFixed(1)}%`}</Text>
           <Text>{`MEM ${bar(share(totals.rssKb, machine.memoryKb))} ${memory(totals.rssKb)}`}</Text>
-          <Text dimColor>{`TOKENS ${count(totals.tokensIn)} / ${count(totals.tokensOut)}`}</Text>
+          <Text color="inactive">{`TOKENS ${count(totals.tokensIn)} / ${count(totals.tokensOut)}`}</Text>
         </Box>
       )
     },
@@ -257,22 +270,22 @@ function kitOf(surface: RenderSurface, table: Table, columns: number, act: Actio
       <Button key={`toggle-${section}`} label={`${isOpen ? '⌃' : '⌄'}  ${label}`} onPress={() => void act.toggle(section)} />
     ),
     quiet: label => <Text bold>{label}</Text>,
-    note: (message, tone) => (tone === 'alarm' ? <Text color="error">{message}</Text> : <Text dimColor>{message}</Text>),
+    note: (message, tone) => (tone === 'alarm' ? <Text color="error">{message}</Text> : <Text color="inactive">{message}</Text>),
     header: (_icon, title, subtitle) => (
       <Box flexDirection="column">
         <Text bold>{clip(title, width - ACTION_CELLS)}</Text>
-        <Text dimColor>{clip(subtitle, width - ACTION_CELLS)}</Text>
+        <Text color="inactive">{clip(subtitle, width - ACTION_CELLS)}</Text>
       </Box>
     ),
     table: (lines, more) => (
       <Box flexDirection="column">
-        <Text dimColor>{`${'PID'.padStart(6)}  ${'CPU'.padStart(6)}  ${'MEM'.padStart(8)}  COMMAND`}</Text>
+        <Text color="inactive">{`${'PID'.padStart(6)}  ${'CPU'.padStart(6)}  ${'MEM'.padStart(8)}  COMMAND`}</Text>
         {lines.map(line => (
-          <Text dimColor={line.isFaint}>
+          <Text {...(line.isFaint ? { color: 'inactive' } : {})}>
             {clip(`${String(line.pid).padStart(6)}  ${line.cpu.padStart(6)}  ${line.mem.padStart(8)}  ${line.command}`, width)}
           </Text>
         ))}
-        {more > 0 && <Text dimColor>{`${' '.repeat(28)}+ ${more} more`}</Text>}
+        {more > 0 && <Text color="inactive">{`${' '.repeat(28)}+ ${more} more`}</Text>}
       </Box>
     ),
     pill: status => <Text bold>{status}</Text>,

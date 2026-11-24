@@ -1,5 +1,17 @@
 # Changes
 
+## 1.0.5
+
+- The board reads on a dark terminal theme. Its cards were filled with pastel,
+  which washed out the theme's light text; on a terminal they now keep only a
+  rose or lavender frame, deep enough to show on a light theme as well, and their
+  text takes the theme's colours. The desktop app draws its cards' text in its
+  own dark ink, so they keep the fill there.
+- Secondary text on a terminal (subtitles, column heads, token counts) is in the
+  theme's own grey instead of faint, which some terminals dim to under 3:1.
+- The board's plain title, drawn where the terminal is too narrow for the pixel
+  one, is no longer cream, which a light theme hid.
+
 ## 1.0.4
 
 - Recognizes a Claude Code session running on the npm package's native
